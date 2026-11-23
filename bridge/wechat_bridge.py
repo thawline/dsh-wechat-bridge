@@ -73,6 +73,9 @@ POLL_SEC = 2.0
 # 群里只有被点名才转（正文里带这些词之一）。私聊不受这个限制。
 ALIASES = []
 DEFAULT_ALIASES = "大肥鱼,鲸鲸,鲸鱼娘,鲸鱼,肥鱼"
+# 本桥接微信账号的 wxid / 昵称：启动时注入，群里 @ 本账号时自动算点名
+MY_WXID = ""
+MY_NICK = ""
 
 # 从 DSH 设置页拉的配置（每 30 秒刷一次）
 CFG = {
@@ -166,6 +169,59 @@ def clean_text(text):
     return " ".join(t.split()).strip()
 
 
+def 出站过滤词表():
+    """主人在配置里列的出站违禁子串（比如不想出现的 emoji 和口头禅）。
+    现读配置文件，改完即刻生效，不用重启桥。"""
+    try:
+        home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+        with open(os.path.join(home, "wechat-bridge-config.json"), encoding="utf-8-sig") as f:
+            c = json.load(f) or {}
+        return [str(x).strip() for x in (c.get("出站文字过滤") or []) if str(x).strip()]
+    except Exception:
+        return []
+
+
+_AT_TOKEN = re.compile(r"[@＠]\s*([^\s@＠:：,，。、;；!！?？\u2005]{1,30})")
+
+
+def 点名别名表():
+    """群里叫到这些名字才算点名。来源三合一：
+    ① 桥接启动参数 --aliases；② 主人配置「点名别名」（现读磁盘，改完即刻生效）；
+    ③ 本账号自己的昵称（启动时从通讯录拿）。"""
+    表 = [str(a).strip() for a in ALIASES if str(a).strip()]
+    try:
+        home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+        with open(os.path.join(home, "wechat-bridge-config.json"), encoding="utf-8-sig") as f:
+            c = json.load(f) or {}
+        for x in (c.get("点名别名") or []):
+            x = str(x).strip()
+            if x and x not in 表:
+                表.append(x)
+    except Exception:
+        pass
+    if MY_NICK and MY_NICK not in 表:
+        表.append(MY_NICK)
+    return 表
+
+
+def 被at了(raw):
+    """@ 检测加固：微信 @ 人时正文里带的是对方的备注/昵称原文。
+    只看 @ 后面那个词是否命中别名（整串包含或互为前后缀都行），
+    平时闲聊提到名字不会被误判成点名；老参数 --aliases 仍按全文子串兜底。"""
+    raw = raw or ""
+    if any(a in raw for a in ALIASES if str(a).strip()):
+        return True
+    表 = 点名别名表()
+    for tok in _AT_TOKEN.findall(raw):
+        tok = tok.strip()
+        for a in 表:
+            if not a:
+                continue
+            if a in tok or (len(tok) >= 2 and tok in a):
+                return True
+    return False
+
+
 # ---------- HTTP ----------
 
 def http_json(path, payload=None, method=None):
@@ -210,6 +266,18 @@ def main():
             log("发送节流档位：", _p.name, "（%d 秒内 %d 次）" % (int(_p.window), _p.burst))
         except Exception as _e:
             log("节流档位调整失败（不影响用）：", repr(_e))
+
+        # DB 验货（发完回读确认）：微信写库是异步的，默认 8 秒太紧 —— 微信写库一慢，
+        # 明明发成功的消息也被判「未确认」，上层就补回车：每条白钝 13 秒，还有重发风险。
+        # 放宽到 20 秒；再查不到交给 试() 里的桥接层二次核对兜底。
+        try:
+            from wechatauto.param import WxParam as _WP
+
+            _WP.DB_VERIFY_TIMEOUT = 20
+            _WP.DB_VERIFY_INTERVAL = 1.0
+            log("DB 验货超时：8s → 20s（治「库里没确认补回车」）")
+        except Exception as _e:
+            log("DB 验货超时调整失败（不影响用）：", repr(_e))
     except Exception as e:
         log("✗ import wechatauto 失败：", repr(e))
         log("  依赖没装好 —— 回 DSH 设置页点「装依赖」")
@@ -233,10 +301,13 @@ def main():
         log("  检查：微信登录了吗？微信 → 设置 → 文件管理 → 默认保存位置")
         return 2
     me = getattr(db, "wxid", "")
+    global MY_WXID, MY_NICK
+    MY_WXID = str(me or "")
     log("当前账号 wxid：", me)
     try:
         info = db.get_self_info() or {}
-        log("昵称：", info.get("nick_name") or info.get("remark") or "?")
+        MY_NICK = str(info.get("nick_name") or info.get("remark") or "").strip()
+        log("昵称：", MY_NICK or "?")
     except Exception:
         pass
 
@@ -959,7 +1030,12 @@ def main():
         return False
 
     def 拆条(text: str, 上限: int = 26):
-        """把一段话拆成几条短消息：先按换行分段，长段再按句子拆。"""
+        """单气泡模式：整段不超上限就发一条——正文里的换行原样保留，
+        微信输入框粘贴多行文字只换行不发送，等同 Ctrl+回车，全数装进一个气泡。
+        超过上限的长文才拆多条：先按换行断开，长段再按句子拆（老逻辑兜底）。"""
+        全文 = str(text or "").strip()
+        if 0 < len(全文) <= 上限:
+            return [全文]
         out = []
         for 段 in re.split(r"\n+", str(text or "")):
             段 = 段.strip()
@@ -1014,6 +1090,16 @@ def main():
         except Exception:
             pass
         return False
+
+    # 两个可调旋钮（主人按需调）：
+    # 发送前置前：发送前强制把微信窗口摆到前台，治「窗口被挡 → UIA 卡住 → 发送超时」
+    # （实测几次发送卡死皆源于此）。finally 里已有 _取消置顶 + _还原窗口，
+    # 发完会把前台还给主人。想回到安静模式就改成 False。
+    发送前置前 = True
+    # 拆条上限：原来 26 字一条，回个话像机关枪扫射，且每条都要走一遍粘贴-回车-验货。
+    # 常见诉求：每回应装进一个气泡——微信输入框粘贴多行文字只换行不发送（Ctrl+回车同理），
+    # 故把上限放宽到一整篇；除非长过贴不进输入框，否则不拆。
+    拆条上限 = 1500
 
     # 进程内「这句我已经发出去过」的记录。数据库查询有 25/120 秒的时间窗，
     # 兜底通道晚几秒醒来、或者拆条后隔了几十秒再补发，窗口一过就会重复发一遍
@@ -1337,6 +1423,14 @@ def main():
 
         text = re.sub(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", _摘图, text).strip()
 
+        # 出站过滤（主人在配置里列的违禁子串）：命中即从正文剥除；
+        # 词表现读配置文件，主人改完配置即刻生效，不用重启桥。
+        for 滤 in 出站过滤词表():
+            if 滤 and 滤 in text:
+                text = text.replace(滤, "")
+                log("🚫 出站被过滤拦下子串：「%s」" % 滤[:30])
+        text = text.strip()
+
         if not text and not images:
             return {"ok": False, "说": "空消息"}
         if not chat:
@@ -1350,9 +1444,9 @@ def main():
             窗口快照 = _快照窗口()
             守护 = _守护最小化(窗口快照.get("hwnd")) if 窗口快照.get("iconic") else None
             try:
-                # 先不抢前台：同一条会话里连发时，UIA 直接写控件就够了，
-                # 把窗口顶上来只会让主人看见它闪。只有要切会话时才摆正窗口。
-                _ensure_wechat_ready(前台=False)
+                # 发送前置前=True：先把微信摆到前台再动 —— 「UIA 卡死/窗口卡住」多半
+                # 是微信被别的窗口压着造成的。想安静发送就把旋钮改成 False。
+                _ensure_wechat_ready(前台=发送前置前)
                 gui = get_gui()
                 # 每次发送前重取一次引擎：微信跑久了 accessibility 会假死，
                 # 缓存的引擎能收消息却一条也发不出去
@@ -1410,7 +1504,7 @@ def main():
                         return "发送超时"
                     return 盒.get("e") or 盒.get("r")
 
-                def 试(动作, 名字, 重试前=1):
+                def 试(动作, 名字, 重试前=1, 核对=None):
                     """发一次；返回失败（不是抛异常）也要当成失败 —— 窗口没接住时就是这样。"""
                     for 第 in range(重试前 + 1):
                         try:
@@ -1426,7 +1520,28 @@ def main():
                             原因 = str(r)
                         # 已经发出去了、只是数据库还没落库 —— 再发一遍就成了两条重复消息
                         if "未确认" in 原因 or "已操作发送" in 原因:
-                            # 但字也可能压根没发出去，就卡在输入框里 —— 补一次回车再确认
+                            # 微信写库是异步的：库里 8~20 秒查不到 ≠ 没发出去。先花十几秒
+                            # 用桥接层自己的包含匹配（库端 exact 逐字太苛刻）补核一遍；
+                            # 核到了就别碰回车 —— 「补的那一脚」才是重复消息的源头。
+                            补核到了 = False
+                            if 核对 is not None:
+                                for _ in range(6):
+                                    try:
+                                        if 核对():
+                                            补核到了 = True
+                                            break
+                                    except Exception:
+                                        break
+                                    time.sleep(1.8)
+                            if 补核到了:
+                                log("库里迟到的确认（没补回车）：" + 原因[:50])
+                                return True
+                            # 库里真没有：字还堵在输入框里才值得踹一脚；
+                            # 框已空说明多半是发出去了、库只是写得慢，别再乱按回车。
+                            框 = _框里的字()
+                            if 框 is not None and not 框.strip():
+                                log("发出去但库里没确认，输入框已空，不补回车：" + 原因[:50])
+                                return True
                             if _kick_enter():
                                 time.sleep(1.2)
                                 log("已操作发送但库里没确认，补了一次回车：" + 原因[:50])
@@ -1446,7 +1561,7 @@ def main():
 
                 if text:
                     # 长内容拆成几条短消息发（一个大气泡读着累）—— 每段不超过 60 字
-                    for 一 in 拆条(text):
+                    for 一 in 拆条(text, 上限=拆条上限):
                         # 重试前先看库里：这句话刚发过就不再点第二遍
                         if _段已发过(一):
                             log("这句我发过（内存记录），跳过：%s" % 一[:30])
@@ -1456,7 +1571,8 @@ def main():
                             _记发过(一)
                             recently_sent.append((clean_text(一), time.time()))
                             continue
-                        ok = 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字")
+                        ok = 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字",
+                                核对=lambda: _already_sent(一, chat, within=90))
                         if not ok and _already_sent(一, chat, within=25):
                             log("接口说失败，但库里查到了 —— 算发成功：%s" % 一[:30])
                             ok = True
@@ -1478,7 +1594,8 @@ def main():
                                 _ensure_wechat_ready(前台=True)
                                 time.sleep(0.5)
                                 gui.open_chat(chat)
-                                if 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字（前台重试）"):
+                                if 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字（前台重试）",
+                                       核对=lambda: _already_sent(一, chat, within=90)):
                                     ok = True
                             except Exception as e:
                                 log("前台重试异常：", repr(e))
@@ -1894,10 +2011,35 @@ def main():
             p = 媒体["下载器"].download_image(
                 username, local_id, save_dir=folder, tier="best", shard=msg.get("shard")
             )
-            if p and os.path.isfile(p) and os.path.getsize(p) > 0:
-                log("图片落盘：%s" % p)
-                return p
-            return None
+            if not (p and os.path.isfile(p) and os.path.getsize(p) > 0):
+                return None
+            if str(p).lower().endswith(".wxgf"):
+                # wxgf 是微信自家容器（内封 HEVC），机器看不懂。退回缩略图档：
+                # 缩略图是普通 jpg，视觉模型和读图工具都认得，总比一团雾气强。
+                try:
+                    t = 媒体["下载器"].download_image(
+                        username, local_id, save_dir=folder, tier="thumb", shard=msg.get("shard")
+                    )
+                    if t and os.path.isfile(t) and os.path.getsize(t) > 0:
+                        log("wxgf 机器不认，退回缩略图：%s" % t)
+                        p = t
+                except Exception as e:
+                    log("wxgf 退缩略图失败：", repr(e))
+            # 拿到的是缩略图档 ⇒ 本机根本没存原件（微信按需下载，_h.dat 未落盘）。
+            # 驱动界面走一趟点击路径，把真原件取回来；取不到仍用缩略图，总比没有强。
+            if "_thumb" in os.path.basename(str(p)).lower():
+                try:
+                    o = 媒体["下载器"].download_image_original(
+                        username, local_id, save_dir=folder, shard=msg.get("shard"), timeout=30
+                    )
+                    if (o and os.path.isfile(o) and os.path.getsize(o) > os.path.getsize(p)
+                            and not str(o).lower().endswith(".wxgf")):
+                        log("取回原图：%s（%d KB）" % (o, os.path.getsize(o) // 1024))
+                        return o
+                except Exception as e:
+                    log("取原图失败（退回缩略图）：", repr(e))
+            log("图片落盘：%s" % p)
+            return p
         except Exception as e:
             log("图片落盘失败：", repr(e))
             return None
@@ -2129,7 +2271,7 @@ def main():
             # 群里：点名 / 主人说话 / 活跃群 才进 DSH（不然每个群都在刷屏）
             at_me = False
             if is_group:
-                at_me = any(a in raw for a in ALIASES)
+                at_me = 被at了(raw)
                 called = (
                     at_me
                     or is_master(sender, nickname)
