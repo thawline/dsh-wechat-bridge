@@ -1,7 +1,9 @@
 // 临时自测：假 ctx 把 host.js 跑起来，验 保存/绑定/屏蔽/工具/最近聊天
-import { apply } from './lib/host.js'
+import * as 宿主 from './lib/host.js'
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+
+const { apply } = 宿主
 
 const 家 = process.env.DSH_HOME
 const 配置路径 = join(家, 'wechat-bridge-config.json')
@@ -58,7 +60,21 @@ const ctx = {
   tools: { register: (t) => 工具.push(t) },
 }
 
-const 屏 = apply(ctx)
+// 假 ctx 得跟真宿主一样守规矩：没写进 inject 的服务**不许**直接取 ——
+// 真 Cordis 会抛 cannot get property "x" without inject。以前这里把 tools 直接摆在
+// ctx 上，于是 inject 漏了 tools 也照样跑绿，线上却两个工具静默挂不上。
+const 基础 = new Set(['get', 'set', 'effect', 'on', 'emit', 'inject', 'parallel', 'logger', 'fiber', 'scope'])
+const 允许 = new Set([...基础, ...(宿主.inject || [])])
+const 严ctx = new Proxy(ctx, {
+  get(目标, 键) {
+    if (typeof 键 === 'string' && 键 in 目标 && !允许.has(键)) {
+      throw new Error(`cannot get property "${键}" without inject`)
+    }
+    return Reflect.get(目标, 键)
+  },
+})
+
+const 屏 = apply(严ctx)
 
 const 假req = (体) => ({
   headers: {},
@@ -81,6 +97,7 @@ const 断言 = (名, 条件, 细节) => {
 }
 
 // 1 路由与工具都挂上了
+断言('inject 里声明了 tools', (宿主.inject || []).includes('tools'), 宿主.inject)
 断言('注册了 2 个工具', 工具.length === 2, 工具.map((t) => t.name))
 断言('注册了路由', 路线.has('/dsh-wechat-bridge/save') && 路线.has('/dsh-wechat-bridge/state'), [...路线.keys()])
 
