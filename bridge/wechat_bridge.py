@@ -998,18 +998,52 @@ def main():
             return chat
 
 
+    def _same_sent_text(stored, sent, min_overlap=6):
+        """库里这一条，是不是「我们刚想发的那一条」。
+
+        原判断是 `c == text or text in c or c in text`：不看方向，包含关系两个方向都算。
+        其中 `c in text`（库里那条是我们文本的一个片段）会把「对方刚说的话」当成
+        「这条回复已经发过」——对方发 `[玫瑰]`、回复是 `[玫瑰] 收下了…` 时
+        `"[玫瑰]" in 回复` 成立，整条回复被跳过不发，调用方还照样打「✅ 已发」。
+
+        收紧成两条，各自对应原设计真正要覆盖的场景：
+          - 完全相等：UI 自动化把字点出去了，库里落地原样一条；
+          - 我方**完整文本**被更长的一条包含（`text in c`）：库里那条带了引用前缀、
+            表情代码等装饰，仍应算发过（这条保留原 `text in c` 的用意）。
+            不足 min_overlap 的短句不做包含比较，只能靠「完全相等」命中，
+            免得「好」「[微笑]」这类片段在长句里到处命中。
+        不再使用 `c in text`：短片段落在我们的长回复里，证明不了这条回复发过。
+        """
+        a = clean_text(stored or "")
+        b = clean_text(sent or "")
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return len(b) >= min_overlap and b in a
+
     def _already_sent(text, chat, within=60):
-        """库里最近已经有这句话 → 其实发出去了，别再点一次（点了就是重复消息）。"""
+        """库里最近已经有「我们自己发出去的」这句话 → 别再点一次（点了就是重复消息）。
+
+        两个条件缺一不可：在时间窗内、且方向是我们自己发的。
+        对方刚说的话不能拿来证明我们已经发过，否则回复只要复述了对方原话
+        （`[玫瑰]` → `[玫瑰] 收下了`）就会整条被吞掉，而且日志仍报成功。
+        方向未知（老库/字段缺失）时保守放行，交给 _same_sent_text 判定，
+        避免「查不到方向 → 一律当没发过 → 重复发一遍」这个反向问题。
+        """
         try:
             u = _chat_username(chat)
             rows = db.get_messages(u, limit=12)
+            me = getattr(db, "wxid", "")
             now = time.time()
             for m in rows or []:
                 ts = float(m.get("create_time") or 0)
                 if not ts or abs(now - ts) > within:
                     continue
-                c = clean_text(m.get("content") or "")
-                if c and (c == text or text in c or c in text):
+                sender = m.get("sender_username") or ""
+                if me and sender and sender != me:
+                    continue          # 明确是对方发的，不能算作「我已经发过」
+                if _same_sent_text(m.get("content"), text):
                     return True
         except Exception:
             pass
@@ -1446,6 +1480,7 @@ def main():
 
                 if text:
                     # 长内容拆成几条短消息发（一个大气泡读着累）—— 每段不超过 60 字
+                    真发条数 = 0        # 真正点出去的段数：全是「判定已发过」时不能报 ✅
                     for 一 in 拆条(text):
                         # 重试前先看库里：这句话刚发过就不再点第二遍
                         if _段已发过(一):
@@ -1496,13 +1531,19 @@ def main():
                         # 拆开发出去的每一条都记账 —— 不然文件传输助手里会被当成主人说的话读回来
                         recently_sent.append((clean_text(一), time.time()))
                         _记发过(一)
+                        真发条数 += 1
                         time.sleep(0.35)
                     recently_sent.append((clean_text(text), time.time()))
                     _记发过(text)
                     STATE["last_send"] = time.time()
                     if len(recently_sent) > 100:
                         del recently_sent[:-100]
-                    log("✅ 已发到微信（%s）：%s" % (chat, text[:40]))
+                    if 真发条数:
+                        log("✅ 已发到微信（%s）：%s" % (chat, text[:40]))
+                    else:
+                        # 每一段都被判定成「刚发过」，这次一个字都没点出去。
+                        # 还打 ✅ 会让人以为发成功了（排查时被日志带偏）。
+                        log("⏭ 判定为已发过，本次未重复发送（%s）：%s" % (chat, text[:40]))
                     发了 = True
 
                 临时图 = []
