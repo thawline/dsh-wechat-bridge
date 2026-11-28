@@ -3,8 +3,8 @@
 """
 DSH · 微信桥接 Mac 版 v2（OCR 采集 + AppleScript 发送；不注入、不修改微信、不碰数据库）
 
-由 bridge/wechat_bridge.py 分发器在 macOS 上拉起（host.js 零改动）；采集工具二进制
-默认在本目录旁的 mac-bin/（wx_winid / wx_ocr / wx_pixel，swift 源码在 ../swift/）。
+由 bridge/wechat_bridge.py 平台分发器在 macOS 上拉起（host.js 零改动）；
+采集工具二进制默认在本目录旁的 mac-bin/（wx_winid / wx_ocr / wx_pixel，swift 源码在 ../swift/）。
 
 与 Windows 版同一 HTTP 契约，桥脚本可互换：
   - 收：每轮截窗 → accurate OCR 读取「当前已打开会话」的气泡 → 新消息 POST /dsh-wechat-bridge/receive；
@@ -42,6 +42,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -69,6 +70,7 @@ _miss_streak = 0     # 窗口连续缺失轮数（自愈计数）
 _last_reopen = 0.0   # 上次 reopen 尝试时刻
 last_open_title = "" # 当前读取的已打开会话标题（切换会话时重置指纹，不推历史）
 log_fd = None
+_SAVE_LOCK = threading.Lock()   # 状态写盘锁：采集循环与出站线程都写 ocr_state.json
 
 TIME_RE = re.compile(r"^((?:[01]?\d|2[0-3]):[0-5]\d|星期[一二三四五六日天]|昨天|前天|\d{1,2}/\d{1,2})$")
 NEWMSG_RE = re.compile(r"新消息$")
@@ -141,18 +143,20 @@ def load_state():
 
 def save_state():
     global sidebar_snap, seen_bubbles
-    os.makedirs(STATE_DIR, exist_ok=True)
-    now = time.time()
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "sidebar": sidebar_snap,
-                "seen": {k: list(v) for k, v in seen_bubbles.items()},
-                "sent_texts": {k: v for k, v in sent_texts.items()
-                               if now - v < 180},
-            }, f, ensure_ascii=False)
-    except Exception as e:
-        log("⚠ 状态保存失败：", repr(e))
+    # 加锁防半截写：采集循环与出站线程并发写，torn write 会丢回显键 → 重启窗口内回声重推
+    with _SAVE_LOCK:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        now = time.time()
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "sidebar": sidebar_snap,
+                    "seen": {k: list(v) for k, v in seen_bubbles.items()},
+                    "sent_texts": {k: v for k, v in sent_texts.items()
+                                   if now - v < 180},
+                }, f, ensure_ascii=False)
+        except Exception as e:
+            log("⚠ 状态保存失败：", repr(e))
 
 
 # ---------------- 采集三件套 ----------------
@@ -340,8 +344,11 @@ def parse_bubbles(rows, img_w, png=None, ox=0, oy=0):
         if png:
             mid_y = (b["rows"][0]["y"] + b["rows"][-1]["y"]) // 2 + 12
             rgb = probe_color(png, ox + b["x_start"] + 4, oy + mid_y)
-            if rgb:
-                side = "out" if is_wechat_green(rgb) else "in"
+            # 只把「绿」当正向证据：探针落在文字笔画/抗锯齿边时非绿属正常，若据非绿判 in
+            # 会把右侧长气泡误判成别人的 → 自己回声被当漏收回推（2026-11-28 实锤）。
+            # 非绿交几何兜底，最终还有 sent_texts 180s 全局回显闸兜底。
+            if rgb and is_wechat_green(rgb):
+                side = "out"
         if side is None:
             if b["x_end"] > img_w * 0.935:
                 side = "out"
@@ -421,7 +428,8 @@ def send_via_ui(chat, text):
     # 发送前先武装防回环（发送静默 20s + 文本回显 180s）——防接收循环竞态：
     # 接收循环可能在回车后的下一拍就把新气泡读到，若先读后武装就会自己推自己
     sent_echo[(chat, norm(text))] = time.time()
-    muted_until[chat] = time.time() + 20
+    muted_until[norm(chat)] = time.time() + 20
+    sent_texts[norm(text)] = time.time()   # 全局回显键也预武装：标题变体互换也拦得住
     run(["osascript", "-e", 'tell application "System Events" to key code 36'],
         timeout=15)
     time.sleep(1.0)
@@ -429,27 +437,38 @@ def send_via_ui(chat, text):
     if prev_app and "微信" not in prev_app and "WeChat" not in prev_app:
         run(["open", "-a", prev_app], timeout=15)
 
-    # 发送复核：文本出现在右侧气泡 或 输入框已清空
-    info3 = window_info() or info2
-    png3 = os.path.join(STATE_DIR, "wx_send2.png")
-    if capture_window(info3.get("windowid", 0), png3):
-        s3 = float(info3.get("scale") or 2.0)
-        w_px3 = int(info3["w"] * s3)
-        side_px3 = int(312 * s3)
-        top3 = int(88 * s3)
-        bot3 = int((int(info3["h"]) - 140) * s3)
-        rows3 = ocr_png(png3)
-        bubbles = parse_bubbles(slice_rows(rows3, side_px3, top3, w_px3, bot3),
-                                w_px3 - side_px3, png3, side_px3, top3)
+    # 发送复核：文本出现在右侧气泡 或 输入框已清空。
+    # 坑（2026-11-28 实测）：消息其实已落屏，但 +1s 首查赶在渲染/OCR 稳定前没读到，
+    # 会留下「发送未确认」假失败账（不会重发，但审计失信）。给一次 +1.5s 二查——宁慢不误报。
+    def _verify():
+        info = window_info() or info2
+        png = os.path.join(STATE_DIR, "wx_send2.png")
+        if not capture_window(info.get("windowid", 0), png):
+            return None, ""   # 截窗失败：不当失败，按「无法复核」放行
+        s = float(info.get("scale") or 2.0)
+        w_px = int(info["w"] * s)
+        side_px = int(312 * s)
+        top = int(88 * s)
+        bot = int((int(info["h"]) - 140) * s)
+        rows = ocr_png(png)
+        bubbles = parse_bubbles(slice_rows(rows, side_px, top, w_px, bot),
+                                w_px - side_px, png, side_px, top)
         outs = norm("".join(t for side, t in bubbles if side == "out"))
         if want and want in outs:
             return True, "已发送（气泡复核命中）"
-        inp3 = norm("".join((r.get("text") or "") for r in slice_rows(
-            rows3, side_px3, bot3, w_px3, int(info3["h"] * s3))))
-        if not inp3:
+        inp = norm("".join((r.get("text") or "") for r in slice_rows(
+            rows, side_px, bot, w_px, int(info["h"] * s))))
+        if not inp.replace("发送", ""):   # 输入区只剩「发送」按钮标签 = 已清空
             return True, "已发送（输入框已清空）"
         return False, "发送未确认：气泡/输入框均未检测到"
-    return True, "已发送（无法截窗复核）"
+
+    ok, 说 = _verify()
+    if ok is False:
+        time.sleep(1.5)   # 二次机会：等渲染/OCR 稳定再核一轮
+        ok, 说 = _verify()
+    if ok is None:
+        return True, "已发送（无法截窗复核）"
+    return ok, 说
 
 
 def outbox_loop(dry_send):
@@ -477,6 +496,7 @@ def outbox_loop(dry_send):
                     muted_until[norm(chat)] = time.time() + 15
                     # 全局回显键：标题 OCR 变体（「李健主号」/「李健 主号」）互换也能拦住
                     sent_texts[norm(text)] = time.time()
+                    save_state()   # 立刻持久化回显键：重启窗口内也不丢（防重启后回声重推）
                 http_json("/dsh-wechat-bridge/outbox/ack", {
                     "ok": bool(res["ok"]),
                     "chat": chat,
