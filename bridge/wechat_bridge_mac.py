@@ -62,6 +62,7 @@ TOOL_DIR = ""       # bin 目录（wx_winid / wx_ocr）
 sidebar_snap = {}    # 会话名 -> 预览文本（上次扫描）
 seen_bubbles = {}    # 会话名 -> deque([...]) 最近消息文本（防重复推送）
 sent_echo = {}       # (会话名, 规整文本) -> 发送时刻
+sent_texts = {}      # 规整文本 -> 发送时刻（全局回显键，免疫标题 OCR 变体）
 muted_until = {}     # 会话名 -> 时刻（发送后静默窗口）
 last_push = {}       # 会话名 -> 上次推送时刻（每会话限频）
 _miss_streak = 0     # 窗口连续缺失轮数（自愈计数）
@@ -141,11 +142,14 @@ def load_state():
 def save_state():
     global sidebar_snap, seen_bubbles
     os.makedirs(STATE_DIR, exist_ok=True)
+    now = time.time()
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "sidebar": sidebar_snap,
                 "seen": {k: list(v) for k, v in seen_bubbles.items()},
+                "sent_texts": {k: v for k, v in sent_texts.items()
+                               if now - v < 180},
             }, f, ensure_ascii=False)
     except Exception as e:
         log("⚠ 状态保存失败：", repr(e))
@@ -470,7 +474,9 @@ def outbox_loop(dry_send):
                     log("%s → %s：%s" % ("✓" if ok else "✗", chat, text[:40]))
                 if res["ok"]:
                     sent_echo[(chat, norm(text))] = time.time()
-                    muted_until[chat] = time.time() + 15
+                    muted_until[norm(chat)] = time.time() + 15
+                    # 全局回显键：标题 OCR 变体（「李健主号」/「李健 主号」）互换也能拦住
+                    sent_texts[norm(text)] = time.time()
                 http_json("/dsh-wechat-bridge/outbox/ack", {
                     "ok": bool(res["ok"]),
                     "chat": chat,
@@ -527,9 +533,10 @@ def read_open_chat(info, png, rows=None, sidebar_y=None):
 
 def push_message(chat, text):
     now = time.time()
-    if now - last_push.get(chat, 0) < 5:
+    k = norm(chat)
+    if now - last_push.get(k, 0) < 5:
         return False
-    last_push[chat] = now
+    last_push[k] = now
     r = http_json("/dsh-wechat-bridge/receive", {
         "text": text,
         "chat": chat,
@@ -598,17 +605,24 @@ def receive_once(debug=False):
 
     # 核心：只采集「当前打开会话」的新消息（永不搜索开会话）
     if title:
+        # 坑（2026-11-28 实测）：同一会话标题会被 OCR 成「李健主号」/「李健 主号」两种变体，
+        # 按原样当钥匙会把 seen/静默/回显全部劈成两份 → 切换判定抖动 + 自己的回声被当新消息
+        # （自检时 AI 回复被标题变体判定为「切会话→停机漏收」实锤推回 DSH）。统一用归一键。
+        ckey = norm(title)
         incoming = [t for side, t in bubbles if side == "in"]
-        seen = seen_bubbles.setdefault(title, deque(maxlen=40))
-        if title != last_open_title:
+        seen = seen_bubbles.setdefault(ckey, deque(maxlen=40))
+        if ckey != last_open_title:
             # 刚切到这个会话：铺底防回环。
             # 坑（2026-11-28 实测）：停机期间到达的消息不在持久指纹里，整体铺底会把
             # 它们当历史吞掉（用户 3 条消息实锤被吞、桥无回复）。改为：持久指纹里
             # 已有的照旧吞（历史回放），没有的视为停机漏收 → 补推（≤3 条，过 5s 节流）；
             # 仅首次运行（无任何持久状态）才整体铺底，避免首跑推送全部历史。
-            last_open_title = title
+            # 回声兜底：180 秒内自己发过的文本（全局键）永不当「漏收」补推。
+            last_open_title = ckey
             backlogged = [t for t in incoming
-                          if norm(t) not in seen] if seen_bubbles else []
+                          if norm(t) not in seen
+                          and now - sent_texts.get(norm(t), 0) >= 180
+                          ] if seen_bubbles else []
             for t in incoming:
                 if norm(t) not in seen:
                     seen.append(norm(t))
@@ -623,9 +637,8 @@ def receive_once(debug=False):
         else:
             fresh = [t for t in incoming
                      if norm(t) not in seen
-                     and now >= muted_until.get(title, 0)
-                     and not any(norm(t) == k[1] and title == k[0] and now - ts < 180
-                                 for k, ts in sent_echo.items())]
+                     and now >= muted_until.get(ckey, 0)
+                     and now - sent_texts.get(norm(t), 0) >= 180]
             for t in fresh[-3:]:
                 if push_message(title, t):
                     processed += 1
@@ -639,7 +652,7 @@ def receive_once(debug=False):
         for name, preview in cur.items():
             if (first or sidebar_snap.get(name) != preview) \
                     and name != title and name not in CFG["屏蔽"] \
-                    and now >= muted_until.get(name, 0) and preview:
+                    and now >= muted_until.get(norm(name), 0) and preview:
                 log("ℹ「%s」有新消息但未打开该会话（桥只读打开的会话）：%s"
                     % (name, preview[:24]))
         for name in list(sidebar_snap):
@@ -655,10 +668,13 @@ def receive_once(debug=False):
 
 
 def receive_loop(once=False, debug=False):
-    global sidebar_snap, seen_bubbles
+    global sidebar_snap, seen_bubbles, sent_texts
     st = load_state()
     sidebar_snap = st.get("sidebar") or {}
     seen_bubbles = {k: deque(v, maxlen=40) for k, v in (st.get("seen") or {}).items()}
+    now = time.time()
+    sent_texts = {k: float(v) for k, v in (st.get("sent_texts") or {}).items()
+                  if now - float(v) < 180}
     if sidebar_snap:
         log("恢复状态：快照 %d 会话" % len(sidebar_snap))
     empty_streak = 0
