@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -189,12 +190,12 @@ def capture_window(winid, out_png):
     ok, size = _shot()
     if ok:
         return True
-    if size:  # 截到了但可疑地小 → 八成是显示器睡了，唤醒后重试一次
-        run(["caffeinate", "-u", "-t", "2"], timeout=10)
-        time.sleep(1.0)
-        ok, _ = _shot()
-        return ok
-    return False
+    # 2026-11-28 实测：显示器睡着时 screencapture 也可能直接报错（rc!=0、无文件）
+    # —— 与「截到了但体积可疑地小」一并走唤醒重试，不区分失败形态
+    run(["caffeinate", "-u", "-t", "2"], timeout=10)
+    time.sleep(1.0)
+    ok, _ = _shot()
+    return ok
 
 
 def ocr_png(png, crop=None):
@@ -721,6 +722,14 @@ def main():
 
     log("=== Mac 桥 v2 启动 → %s（工具=%s，发=%s，轮询=%.0fs）===" % (
         DSH, TOOL_DIR, "dry" if args.dry_send else "OCR验证", POLL_SEC))
+
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt  # 借既有退出路径：记退出日志并走 finally 终止 caffeinate（防孤儿堆积）
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
 
     refresh_config()
     import threading
