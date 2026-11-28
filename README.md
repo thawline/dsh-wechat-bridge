@@ -177,6 +177,34 @@ dsh plugin --profile desktop add github:thawline/dsh-wechat-bridge
 - **一轮里多条回复会拼起来发**：以前同一轮的第二句会覆盖第一句，微信只能收到最后一句。
 - **临时目录兜底**：某些嵌入式 Python 探测不到可写的 `TEMP`（安全软件拦着时会这样），桥会退到自己的 `tmp/` 目录，不然连微信数据库都打不开。
 
+## macOS 版（OCR 采集，不碰数据库）
+
+Mac 上微信 4.2 的库是 SQLCipher 加密且内存不落明文密钥，读库路线走不通；`bridge/wechat_bridge.py` 入口会按平台自动分发：Windows 走原版（`wechat_bridge_windows.py`，一行未改），macOS 走 `wechat_bridge_mac.py` —— **纯屏幕 OCR 采集**，红线更干净：不解密、不注入、不改微信本体，host.js 零改动。
+
+- **架构（常开会话模型）**：用户在微信里**手动打开目标会话并保持打开**，桥只读这个已打开会话的气泡。侧栏快照差分降级为提示（「某会话有新消息但未打开」），桥**永不调用搜索**。
+- **收消息**：每轮单次全窗 accurate OCR（约 0.25s）→ Python 按坐标切片（侧栏/标题/消息区）→ 新进气泡 `POST /receive`。方向判定优先**颜色探针**（气泡左缘绿=自己发的，标定 106,206,146），几何阈值兜底；文本回显 180 秒、发送静默 15 秒防回环。
+- **发消息**：`GET /outbox` → 校验目标会话已打开（侧栏绿底选中行，标定 76,165,111）→ 剪贴板粘贴 → OCR 验证落进输入框（不盲回车）→ 回车 → OCR 复核气泡 → ack。
+- **前置**：微信已登录且主窗口可见、目标会话已打开；宿主进程有「屏幕录制」授权；编译采集工具（或直接用仓库里已编好的 `bridge/mac-bin/`）：
+  ```bash
+  cd bridge/swift
+  swiftc -O wx_winid.swift -o ../mac-bin/wx_winid
+  swiftc -O wx_pixel.swift -o ../mac-bin/wx_pixel
+  swiftc -O wx_ocr.swift -o ../mac-bin/wx_ocr -framework Vision
+  ```
+- **手跑自测**：
+  ```bash
+  python3 bridge/wechat_bridge.py --scan-debug              # 扫一轮：侧栏快照 + 打开会话气泡解析
+  python3 bridge/wechat_bridge.py --dsh http://127.0.0.1:62890 --dry-send
+  ```
+- **运维**：日志带时间戳、超 5MB 自动轮转；`tools/watchdog.sh` 可在桥进程意外退出时经 `/bridge/start` 正门拉起（`bash tools/install_watchdog.sh install` 装 LaunchAgent）。
+- **实测过的坑（2026-11-27）**：
+  - 微信 4.2 自绘 UI **过滤一切合成鼠标事件**（cliclick/HID 源/PostToPid 全部无效，13 次探针实锤）；Cmd+F 搜索→回车**必然落进搜一搜网页**且面板 Esc/Cmd+W 都关不掉（只能重启=登出）——这是改为常开会话模型的直接原因。
+  - **wx_ocr 内部紧裁剪会显著降精度**：标题「李健主号」误读成「子健エ子」、单字气泡「1」整个丢失；全窗 OCR 全部读对且仅 ~0.25s —— 已禁用一切内部裁剪，全部单次全窗 OCR + 坐标切片。
+  - `wx_ocr` 的 `fast` 模式中文乱码（禁用）。
+  - 深色模式下 OCR 标题有错字 → 会话名用侧栏绿底颜色探针（确定性），标题仅兜底并滤时间戳行。
+  - 显示器睡眠期间截图返回黑图、点击全部空操作——桥常驻 `caffeinate -d`，截图按体积做合理性检查，可疑小图自动唤醒重试；windowid 过期导致截窗失败时自动重查窗口句柄再试一次。
+  - 窗口会自行消失（System Events count=0）→ 桥 15 轮自愈 `reopen`（限频 60s）；重启微信=登出，慎用。
+
 ## 开发自测
 
 改了 `lib/host.js` 或 `lib/client.js` 之后，两个脚本可以直接跑（不用开 DSH，也不碰真实配置 —— 记得把 `DSH_HOME` 指到临时目录）：
